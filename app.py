@@ -1,5 +1,4 @@
 import random
-import re
 import smtplib
 import socket
 import string
@@ -18,6 +17,8 @@ from email_validator import EmailNotValidError, validate_email
 # =========================
 # CONFIGURACION GENERAL
 # =========================
+
+CONTACT_LIMIT = 25000
 
 ROLE_PREFIXES = {
     "admin",
@@ -89,6 +90,44 @@ DISPOSABLE_DOMAINS = {
 
 
 # =========================
+# TIEMPOS ESTIMADOS
+# =========================
+
+def estimate_time_range(contact_count, enable_smtp, enable_catchall):
+    if contact_count <= 0:
+        return "Sin contactos"
+
+    if not enable_smtp:
+        if contact_count <= 500:
+            return "Menos de 1 minuto"
+        if contact_count <= 2000:
+            return "1 a 3 minutos"
+        if contact_count <= 10000:
+            return "3 a 10 minutos"
+        return "10 a 25 minutos"
+
+    if enable_smtp and not enable_catchall:
+        if contact_count <= 500:
+            return "3 a 10 minutos"
+        if contact_count <= 2000:
+            return "10 a 30 minutos"
+        if contact_count <= 10000:
+            return "45 minutos a 3 horas"
+        return "2 a 6 horas"
+
+    if enable_smtp and enable_catchall:
+        if contact_count <= 500:
+            return "5 a 15 minutos"
+        if contact_count <= 2000:
+            return "20 a 60 minutos"
+        if contact_count <= 10000:
+            return "1.5 a 5 horas"
+        return "4 a 10 horas"
+
+    return "Variable"
+
+
+# =========================
 # FUNCIONES DE LIMPIEZA
 # =========================
 
@@ -99,7 +138,6 @@ def clean_email(raw_value):
     text = str(raw_value).strip()
     text = text.replace("mailto:", "").strip()
 
-    # Si viene como "Nombre <correo@dominio.com>"
     parsed_name, parsed_email = parseaddr(text)
     if parsed_email:
         text = parsed_email
@@ -202,8 +240,6 @@ def get_dns_info(domain):
         info["dns_status"] = "ERROR_DNS"
         info["dns_error"] = str(e)
 
-    # Revisión adicional A/AAAA.
-    # No reemplaza MX, pero ayuda a saber si el dominio existe.
     try:
         resolver.resolve(domain, "A")
         info["has_a_or_aaaa"] = True
@@ -378,11 +414,11 @@ def build_score_and_recommendation(row):
 
     if row["dominio_temporal"] == "SI":
         score -= 45
-        reasons.append("Dominio temporal/desechable")
+        reasons.append("Dominio temporal o desechable")
 
     if row["posible_error_dominio"]:
         score -= 30
-        reasons.append(f"Posible typo de dominio: {row['posible_error_dominio']}")
+        reasons.append(f"Posible error de dominio: {row['posible_error_dominio']}")
 
     if row["dominio_existe"] == "NO":
         return 0, "NO ENVIAR", "Dominio no existe"
@@ -601,7 +637,17 @@ if uploaded_file:
         else:
             df = pd.read_excel(uploaded_file)
 
-        st.success(f"Archivo cargado correctamente: {len(df)} filas")
+        total_rows = len(df)
+
+        if total_rows > CONTACT_LIMIT:
+            st.error(
+                f"El archivo tiene {total_rows:,} contactos. "
+                f"El límite recomendado por hoja es de {CONTACT_LIMIT:,} contactos. "
+                "Divide la lista en archivos más pequeños para evitar bloqueos, errores o resultados incompletos."
+            )
+            st.stop()
+
+        st.success(f"Archivo cargado correctamente: {total_rows:,} filas")
 
         email_column = st.selectbox(
             "Selecciona la columna donde están los correos",
@@ -650,6 +696,41 @@ if uploaded_file:
                 "Limitar cantidad de filas a analizar. Usa 0 para analizar todas.",
                 min_value=0,
                 value=0,
+            )
+
+        contacts_to_analyze = total_rows if limit_rows == 0 else min(total_rows, int(limit_rows))
+        estimated_time = estimate_time_range(contacts_to_analyze, enable_smtp, enable_catchall)
+
+        st.subheader("Capacidad y tiempo estimado")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Contactos detectados", f"{total_rows:,}")
+        c2.metric("Límite por archivo", f"{CONTACT_LIMIT:,}")
+        c3.metric("Contactos a analizar", f"{contacts_to_analyze:,}")
+        c4.metric("Tiempo estimado", estimated_time)
+
+        st.caption(
+            "Los tiempos son aproximados. La prueba SMTP y la detección catch all pueden tardar más "
+            "porque dependen de la respuesta de servidores externos."
+        )
+
+        with st.expander("Ver tabla de tiempos promedio"):
+            st.markdown(
+                """
+| Cantidad de contactos | Sin SMTP | Con SMTP | Con SMTP + catch all |
+|---:|---:|---:|---:|
+| 1 a 500 | Menos de 1 minuto | 3 a 10 minutos | 5 a 15 minutos |
+| 501 a 2,000 | 1 a 3 minutos | 10 a 30 minutos | 20 a 60 minutos |
+| 2,001 a 10,000 | 3 a 10 minutos | 45 minutos a 3 horas | 1.5 a 5 horas |
+| 10,001 a 25,000 | 10 a 25 minutos | 2 a 6 horas | 4 a 10 horas |
+                """
+            )
+
+        if contacts_to_analyze > 2000 and enable_smtp:
+            st.info(
+                "Este archivo puede tardar bastante por las pruebas SMTP. "
+                "Si es la primera prueba, puedes limitar el análisis a 100, 500 o 2,000 contactos."
             )
 
         if enable_smtp:
@@ -743,13 +824,12 @@ if uploaded_file:
                         })
 
                     progress.progress(i / total)
-                    status_text.text(f"Analizando {i} de {total} correos...")
+                    status_text.text(f"Analizando {i:,} de {total:,} correos...")
 
             elapsed = round(time.time() - start_time, 2)
 
             result_df = pd.DataFrame(results)
 
-            # Orden sugerido para limpiar antes de campaña
             order_map = {
                 "ENVIAR": 1,
                 "ENVIAR CON CUIDADO": 2,
@@ -787,9 +867,9 @@ if uploaded_file:
             )
 
             st.info(
-                "Recomendación práctica: para una campaña grande, primero manda solo a los que digan ENVIAR. "
-                "Los de ENVIAR CON CUIDADO mándalos en una segunda tanda pequeña. "
-                "Los INCIERTOS revísalos manualmente o mándalos con mucho cuidado. "
+                "Recomendación práctica: primero manda campaña solo a los que digan ENVIAR. "
+                "Los de ENVIAR CON CUIDADO mándalos en una tanda pequeña. "
+                "Los INCIERTOS revísalos manualmente o mándalos con mucha precaución. "
                 "Los NO ENVIAR elimínalos."
             )
 
