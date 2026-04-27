@@ -90,6 +90,32 @@ DISPOSABLE_DOMAINS = {
 
 
 # =========================
+# ESTILO VISUAL
+# =========================
+
+def yellow_note(text):
+    st.markdown(
+        f"""
+        <div style="
+            background-color: #fff59d;
+            color: #000000;
+            padding: 10px 12px;
+            border-radius: 8px;
+            margin-top: 6px;
+            margin-bottom: 14px;
+            font-size: 14px;
+            line-height: 1.45;
+            font-weight: 500;
+            border-left: 5px solid #fbc02d;
+        ">
+            {text}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================
 # TIEMPOS ESTIMADOS
 # =========================
 
@@ -211,10 +237,17 @@ def get_dns_info(domain):
     try:
         mx_answers = resolver.resolve(domain, "MX")
         mx_records = []
+
         for rdata in mx_answers:
-            mx_records.append((int(rdata.preference), str(rdata.exchange).rstrip(".")))
+            mx_records.append(
+                (
+                    int(rdata.preference),
+                    str(rdata.exchange).rstrip(".")
+                )
+            )
 
         mx_records = sorted(mx_records, key=lambda x: x[0])
+
         info["domain_exists"] = True
         info["has_mx"] = len(mx_records) > 0
         info["mx_records"] = mx_records
@@ -280,7 +313,14 @@ def interpret_smtp_code(code):
     return "INCIERTO"
 
 
-def smtp_rcpt_check(email, mx_records, from_email, helo_domain, timeout_seconds=8, max_mx_to_try=2):
+def smtp_rcpt_check(
+    email,
+    mx_records,
+    from_email,
+    helo_domain,
+    timeout_seconds=8,
+    max_mx_to_try=2
+):
     if not mx_records:
         return {
             "smtp_status": "NO_PROBADO",
@@ -359,13 +399,16 @@ def random_fake_email(domain):
 @lru_cache(maxsize=50000)
 def catchall_check_cached(domain, mx_records_text, from_email, helo_domain, timeout_seconds):
     mx_records = []
+
     for part in mx_records_text.split("|"):
         if not part:
             continue
+
         preference, host = part.split(",", 1)
         mx_records.append((int(preference), host))
 
     fake_email = random_fake_email(domain)
+
     result = smtp_rcpt_check(
         fake_email,
         mx_records,
@@ -480,7 +523,15 @@ def build_score_and_recommendation(row):
 # ANALISIS PRINCIPAL
 # =========================
 
-def analyze_one_email(raw_email, is_duplicate, enable_smtp, enable_catchall, from_email, helo_domain, timeout_seconds):
+def analyze_one_email(
+    raw_email,
+    is_duplicate,
+    enable_smtp,
+    enable_catchall,
+    from_email,
+    helo_domain,
+    timeout_seconds
+):
     clean = clean_email(raw_email)
 
     base_row = {
@@ -536,6 +587,7 @@ def analyze_one_email(raw_email, is_duplicate, enable_smtp, enable_catchall, fro
     dns_info = get_dns_info(domain)
 
     domain_exists = dns_info["domain_exists"]
+
     if domain_exists is True:
         base_row["dominio_existe"] = "SI"
     elif domain_exists is False:
@@ -565,6 +617,7 @@ def analyze_one_email(raw_email, is_duplicate, enable_smtp, enable_catchall, fro
 
         if enable_catchall:
             mx_text = mx_records_to_text(dns_info["mx_records"])
+
             catchall_result = catchall_check_cached(
                 domain,
                 mx_text,
@@ -594,14 +647,17 @@ def dataframe_to_excel_bytes(df):
         df.to_excel(writer, index=False, sheet_name="resultado")
 
         worksheet = writer.sheets["resultado"]
+
         for column_cells in worksheet.columns:
             max_length = 0
             column_letter = column_cells[0].column_letter
+
             for cell in column_cells:
                 try:
                     max_length = max(max_length, len(str(cell.value)))
                 except Exception:
                     pass
+
             worksheet.column_dimensions[column_letter].width = min(max_length + 2, 45)
 
     return output.getvalue()
@@ -613,7 +669,6 @@ def dataframe_to_excel_bytes(df):
 
 st.set_page_config(
     page_title="Validador de correos para campañas",
-    page_icon="📧",
     layout="wide",
 )
 
@@ -623,6 +678,11 @@ st.caption("Limpieza y validación de listas antes de enviar campañas masivas."
 st.warning(
     "Importante: ningún método puede confirmar al 100% que un correo está activo sin enviar un correo real. "
     "Esta app calcula una seguridad probable usando formato, DNS, MX, SMTP, catch all y reglas de riesgo."
+)
+
+yellow_note(
+    "Objetivo de la app: ayudarte a reducir rebotes antes de mandar una campaña. "
+    "El resultado correcto no es una garantía absoluta, sino una recomendación de riesgo basada en varias pruebas."
 )
 
 uploaded_file = st.file_uploader(
@@ -654,10 +714,31 @@ if uploaded_file:
             options=df.columns,
         )
 
+        st.markdown("## Configuración del análisis")
+
+        yellow_note(
+            "Configuración recomendada para una primera prueba: SMTP activado, catch all activado, "
+            "timeout en 8 segundos, velocidad en 6 y limitar el análisis a 100 o 500 contactos. "
+            "Después, si todo funciona bien, puedes analizar la base completa."
+        )
+
         with st.expander("Configuración avanzada", expanded=True):
+            st.markdown("### Ajustes del análisis")
+
+            yellow_note(
+                "Aquí puedes decidir qué tan profundo quieres revisar los correos. "
+                "Mientras más pruebas actives, mayor seguridad probable tendrás, pero también tardará más el análisis."
+            )
+
             enable_smtp = st.checkbox(
                 "Activar prueba SMTP sin enviar correo",
                 value=True,
+            )
+
+            yellow_note(
+                "Qué hace esto: intenta preguntarle al servidor del correo si ese destinatario parece válido, "
+                "sin mandar un correo real. Es una de las pruebas más útiles, pero también es de las más lentas. "
+                "Algunos servidores pueden bloquearla y devolver un resultado incierto."
             )
 
             enable_catchall = st.checkbox(
@@ -665,16 +746,34 @@ if uploaded_file:
                 value=True,
             )
 
+            yellow_note(
+                "Qué significa catch all: algunos dominios aceptan cualquier correo, aunque el buzón no exista realmente. "
+                "Esta prueba intenta detectar eso usando un correo inventado del mismo dominio. "
+                "Si el dominio es catch all, el resultado será menos confiable."
+            )
+
             from_email = st.text_input(
                 "Correo FROM para la prueba SMTP",
                 value="verificador@tudominio.com",
-                help="Usa un correo real de tu dominio. No uses correos falsos como gmail.com si no te pertenecen.",
+            )
+
+            yellow_note(
+                "Qué va aquí: debes poner un correo real de tu propio dominio. "
+                "Ejemplo: contacto@tuempresa.com. "
+                "Este correo solo se usa para presentarse ante el servidor durante la validación. "
+                "No uses un correo inventado ni un dominio que no te pertenece."
             )
 
             helo_domain = st.text_input(
                 "Dominio HELO/EHLO",
                 value="tudominio.com",
-                help="Idealmente debe ser el dominio del correo FROM.",
+            )
+
+            yellow_note(
+                "Qué va aquí: solo el dominio de tu empresa, sin arroba. "
+                "Ejemplo: tuempresa.com. "
+                "Normalmente debe coincidir con el dominio del correo FROM. "
+                "Si tu correo FROM es contacto@tuempresa.com, aquí pondrías tuempresa.com."
             )
 
             timeout_seconds = st.slider(
@@ -684,18 +783,35 @@ if uploaded_file:
                 value=8,
             )
 
+            yellow_note(
+                "Qué significa esto: es el tiempo máximo que la app esperará una respuesta del servidor por cada intento SMTP. "
+                "Si lo pones muy bajo, algunos correos pueden salir como inciertos aunque sí sean buenos. "
+                "Si lo pones muy alto, el análisis tardará más. Recomendado: entre 6 y 8 segundos."
+            )
+
             max_workers = st.slider(
                 "Velocidad de análisis",
                 min_value=1,
                 max_value=20,
                 value=6,
-                help="Más velocidad puede causar bloqueos o respuestas inciertas. Para campañas reales, 4 a 8 es razonable.",
+            )
+
+            yellow_note(
+                "Qué significa esto: es cuántos correos se revisan al mismo tiempo. "
+                "Más alto significa más rápido, pero también aumenta el riesgo de bloqueos, respuestas erróneas o resultados inciertos. "
+                "Recomendado para campañas reales: entre 4 y 8."
             )
 
             limit_rows = st.number_input(
                 "Limitar cantidad de filas a analizar. Usa 0 para analizar todas.",
                 min_value=0,
                 value=0,
+            )
+
+            yellow_note(
+                "Para qué sirve esto: si quieres probar primero una parte de tu base, aquí puedes limitar cuántos contactos analizar. "
+                "Ejemplo: pon 100 o 500 para una prueba rápida. "
+                "Si dejas 0, la app analizará todos los contactos del archivo."
             )
 
         contacts_to_analyze = total_rows if limit_rows == 0 else min(total_rows, int(limit_rows))
@@ -710,9 +826,9 @@ if uploaded_file:
         c3.metric("Contactos a analizar", f"{contacts_to_analyze:,}")
         c4.metric("Tiempo estimado", estimated_time)
 
-        st.caption(
-            "Los tiempos son aproximados. La prueba SMTP y la detección catch all pueden tardar más "
-            "porque dependen de la respuesta de servidores externos."
+        yellow_note(
+            "Los tiempos son aproximados. Las pruebas SMTP y catch all pueden tardar más porque dependen de servidores externos. "
+            "Si muchos servidores no responden rápido, el análisis puede tardar más de lo estimado."
         )
 
         with st.expander("Ver tabla de tiempos promedio"):
@@ -744,7 +860,14 @@ if uploaded_file:
                 st.error("El correo FROM debe tener dominio.")
                 st.stop()
 
+            if "tudominio.com" in from_email or helo_domain == "tudominio.com":
+                st.warning(
+                    "Aún tienes valores de ejemplo en el correo FROM o en el dominio HELO/EHLO. "
+                    "Cámbialos por datos reales de tu dominio para obtener resultados más confiables."
+                )
+
         preview_df = df[[email_column]].head(10)
+
         st.subheader("Vista previa")
         st.dataframe(preview_df, use_container_width=True)
 
@@ -759,6 +882,7 @@ if uploaded_file:
 
             seen = set()
             duplicates = []
+
             for email in cleaned_emails:
                 if email and email in seen:
                     duplicates.append(True)
@@ -846,13 +970,20 @@ if uploaded_file:
 
             st.subheader("Resumen")
 
-            c1, c2, c3, c4, c5 = st.columns(5)
+            r1, r2, r3, r4, r5 = st.columns(5)
 
-            c1.metric("Total", len(result_df))
-            c2.metric("Enviar", int((result_df["recomendacion"] == "ENVIAR").sum()))
-            c3.metric("Con cuidado", int((result_df["recomendacion"] == "ENVIAR CON CUIDADO").sum()))
-            c4.metric("Inciertos", int((result_df["recomendacion"] == "INCIERTO").sum()))
-            c5.metric("No enviar", int((result_df["recomendacion"] == "NO ENVIAR").sum()))
+            r1.metric("Total", len(result_df))
+            r2.metric("Enviar", int((result_df["recomendacion"] == "ENVIAR").sum()))
+            r3.metric("Con cuidado", int((result_df["recomendacion"] == "ENVIAR CON CUIDADO").sum()))
+            r4.metric("Inciertos", int((result_df["recomendacion"] == "INCIERTO").sum()))
+            r5.metric("No enviar", int((result_df["recomendacion"] == "NO ENVIAR").sum()))
+
+            yellow_note(
+                "Recomendación de uso: manda primero solo a los contactos marcados como ENVIAR. "
+                "Los de ENVIAR CON CUIDADO pueden ir en una segunda tanda pequeña. "
+                "Los INCIERTOS conviene revisarlos manualmente. "
+                "Los de NO ENVIAR deben eliminarse de la campaña."
+            )
 
             st.subheader("Resultado")
             st.dataframe(result_df, use_container_width=True)
@@ -864,13 +995,6 @@ if uploaded_file:
                 data=excel_bytes,
                 file_name="correos_validados.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.info(
-                "Recomendación práctica: primero manda campaña solo a los que digan ENVIAR. "
-                "Los de ENVIAR CON CUIDADO mándalos en una tanda pequeña. "
-                "Los INCIERTOS revísalos manualmente o mándalos con mucha precaución. "
-                "Los NO ENVIAR elimínalos."
             )
 
     except Exception as e:
