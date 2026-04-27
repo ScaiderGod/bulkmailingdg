@@ -1,8 +1,3 @@
-import random
-import smtplib
-import socket
-import string
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parseaddr
 from functools import lru_cache
@@ -18,7 +13,7 @@ from email_validator import EmailNotValidError, validate_email
 # CONFIGURACION GENERAL
 # =========================
 
-CONTACT_LIMIT = 25000
+CONTACT_LIMIT = 1_000_000
 
 ROLE_PREFIXES = {
     "admin",
@@ -65,6 +60,8 @@ COMMON_DOMAIN_TYPOS = {
     "gmai.com": "gmail.com",
     "gmail.con": "gmail.com",
     "gmail.co": "gmail.com",
+    "gmal.com": "gmail.com",
+    "gmail.cm": "gmail.com",
     "hotmial.com": "hotmail.com",
     "hotmal.com": "hotmail.com",
     "hotmai.com": "hotmail.com",
@@ -119,42 +116,27 @@ def yellow_note(text):
 # TIEMPOS ESTIMADOS
 # =========================
 
-def estimate_time_range(contact_count, enable_smtp, enable_catchall):
+def estimate_time_range(contact_count, unique_domain_count):
     if contact_count <= 0:
         return "Sin contactos"
 
-    if not enable_smtp:
-        if contact_count <= 500:
-            return "Menos de 1 minuto"
-        if contact_count <= 2000:
-            return "1 a 3 minutos"
-        if contact_count <= 10000:
-            return "3 a 10 minutos"
-        return "10 a 25 minutos"
+    if contact_count <= 2_000:
+        return "Menos de 1 a 3 minutos"
 
-    if enable_smtp and not enable_catchall:
-        if contact_count <= 500:
-            return "3 a 10 minutos"
-        if contact_count <= 2000:
-            return "10 a 30 minutos"
-        if contact_count <= 10000:
-            return "45 minutos a 3 horas"
-        return "2 a 6 horas"
+    if contact_count <= 25_000:
+        return "3 a 10 minutos"
 
-    if enable_smtp and enable_catchall:
-        if contact_count <= 500:
-            return "5 a 15 minutos"
-        if contact_count <= 2000:
-            return "20 a 60 minutos"
-        if contact_count <= 10000:
-            return "1.5 a 5 horas"
-        return "4 a 10 horas"
+    if contact_count <= 100_000:
+        return "10 a 30 minutos"
 
-    return "Variable"
+    if contact_count <= 500_000:
+        return "30 minutos a 2 horas"
+
+    return "1 a 4 horas"
 
 
 # =========================
-# FUNCIONES DE LIMPIEZA
+# LIMPIEZA Y VALIDACION
 # =========================
 
 def clean_email(raw_value):
@@ -206,7 +188,7 @@ def validate_syntax(email):
             check_deliverability=False,
             allow_smtputf8=False
         )
-        return True, result.normalized, ""
+        return True, result.normalized.lower(), ""
     except EmailNotValidError as e:
         return False, email, str(e)
 
@@ -215,7 +197,7 @@ def validate_syntax(email):
 # DNS / MX
 # =========================
 
-@lru_cache(maxsize=50000)
+@lru_cache(maxsize=500_000)
 def get_dns_info(domain):
     resolver = dns.resolver.Resolver()
     resolver.timeout = 3
@@ -224,7 +206,7 @@ def get_dns_info(domain):
     info = {
         "domain_exists": False,
         "has_mx": False,
-        "mx_records": [],
+        "mx_records": "",
         "has_a_or_aaaa": False,
         "dns_status": "NO_VERIFICADO",
         "dns_error": "",
@@ -239,37 +221,48 @@ def get_dns_info(domain):
         mx_records = []
 
         for rdata in mx_answers:
-            mx_records.append(
-                (
-                    int(rdata.preference),
-                    str(rdata.exchange).rstrip(".")
-                )
-            )
+            exchange = str(rdata.exchange).rstrip(".")
+            preference = int(rdata.preference)
+
+            if exchange == "":
+                info["domain_exists"] = True
+                info["has_mx"] = False
+                info["mx_records"] = ""
+                info["dns_status"] = "NULL_MX"
+                info["dns_error"] = "El dominio declara que no acepta correo"
+                return info
+
+            mx_records.append((preference, exchange))
 
         mx_records = sorted(mx_records, key=lambda x: x[0])
 
         info["domain_exists"] = True
         info["has_mx"] = len(mx_records) > 0
-        info["mx_records"] = mx_records
+        info["mx_records"] = ", ".join([host for _, host in mx_records])
         info["dns_status"] = "MX_OK"
 
     except dns.resolver.NXDOMAIN:
         info["domain_exists"] = False
+        info["has_mx"] = False
         info["dns_status"] = "DOMINIO_NO_EXISTE"
-        info["dns_error"] = "NXDOMAIN"
+        info["dns_error"] = "El dominio no existe"
         return info
 
     except dns.resolver.NoAnswer:
         info["domain_exists"] = True
+        info["has_mx"] = False
         info["dns_status"] = "SIN_MX"
+        info["dns_error"] = "El dominio existe, pero no tiene registros MX"
 
     except dns.resolver.Timeout:
         info["domain_exists"] = None
+        info["has_mx"] = False
         info["dns_status"] = "TIMEOUT_DNS"
-        info["dns_error"] = "Timeout consultando MX"
+        info["dns_error"] = "Timeout consultando DNS"
 
     except Exception as e:
         info["domain_exists"] = None
+        info["has_mx"] = False
         info["dns_status"] = "ERROR_DNS"
         info["dns_error"] = str(e)
 
@@ -290,154 +283,31 @@ def get_dns_info(domain):
     return info
 
 
-# =========================
-# SMTP
-# =========================
+def preload_dns_for_domains(domains, max_workers):
+    results = {}
 
-def interpret_smtp_code(code):
-    if 200 <= code < 300:
-        return "ACEPTADO"
-
-    if code in [550, 551, 552, 553, 554]:
-        return "RECHAZADO"
-
-    if code in [421, 450, 451, 452]:
-        return "TEMPORAL"
-
-    if 400 <= code < 500:
-        return "TEMPORAL"
-
-    if 500 <= code < 600:
-        return "RECHAZADO"
-
-    return "INCIERTO"
-
-
-def smtp_rcpt_check(
-    email,
-    mx_records,
-    from_email,
-    helo_domain,
-    timeout_seconds=8,
-    max_mx_to_try=2
-):
-    if not mx_records:
-        return {
-            "smtp_status": "NO_PROBADO",
-            "smtp_code": "",
-            "smtp_message": "Sin MX disponible",
-            "smtp_server": "",
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(get_dns_info, domain): domain
+            for domain in domains
+            if domain
         }
 
-    last_error = ""
-
-    for _, mx_host in mx_records[:max_mx_to_try]:
-        try:
-            with smtplib.SMTP(mx_host, 25, timeout=timeout_seconds) as server:
-                server.set_debuglevel(0)
-
-                try:
-                    server.ehlo(helo_domain)
-                except Exception:
-                    server.helo(helo_domain)
-
-                mail_code, mail_msg = server.mail(from_email)
-
-                if int(mail_code) >= 400:
-                    return {
-                        "smtp_status": "INCIERTO",
-                        "smtp_code": mail_code,
-                        "smtp_message": f"MAIL FROM rechazado: {mail_msg}",
-                        "smtp_server": mx_host,
-                    }
-
-                rcpt_code, rcpt_msg = server.rcpt(email)
-
-                try:
-                    server.rset()
-                except Exception:
-                    pass
-
-                return {
-                    "smtp_status": interpret_smtp_code(int(rcpt_code)),
-                    "smtp_code": rcpt_code,
-                    "smtp_message": rcpt_msg.decode(errors="ignore") if isinstance(rcpt_msg, bytes) else str(rcpt_msg),
-                    "smtp_server": mx_host,
+        for future in as_completed(future_map):
+            domain = future_map[future]
+            try:
+                results[domain] = future.result()
+            except Exception as e:
+                results[domain] = {
+                    "domain_exists": None,
+                    "has_mx": False,
+                    "mx_records": "",
+                    "has_a_or_aaaa": False,
+                    "dns_status": "ERROR_DNS",
+                    "dns_error": str(e),
                 }
 
-        except (socket.timeout, TimeoutError):
-            last_error = f"Timeout conectando a {mx_host}:25"
-
-        except smtplib.SMTPServerDisconnected:
-            last_error = f"Servidor desconectó la sesión: {mx_host}"
-
-        except smtplib.SMTPConnectError as e:
-            last_error = f"Error de conexión SMTP con {mx_host}: {e}"
-
-        except smtplib.SMTPHeloError as e:
-            last_error = f"Error HELO/EHLO con {mx_host}: {e}"
-
-        except OSError as e:
-            last_error = f"Error de red con {mx_host}: {e}"
-
-        except Exception as e:
-            last_error = f"Error SMTP con {mx_host}: {e}"
-
-    return {
-        "smtp_status": "INCIERTO",
-        "smtp_code": "",
-        "smtp_message": last_error or "No se pudo completar la prueba SMTP",
-        "smtp_server": "",
-    }
-
-
-def random_fake_email(domain):
-    token = "".join(random.choices(string.ascii_lowercase + string.digits, k=18))
-    return f"noexiste-{token}@{domain}"
-
-
-@lru_cache(maxsize=50000)
-def catchall_check_cached(domain, mx_records_text, from_email, helo_domain, timeout_seconds):
-    mx_records = []
-
-    for part in mx_records_text.split("|"):
-        if not part:
-            continue
-
-        preference, host = part.split(",", 1)
-        mx_records.append((int(preference), host))
-
-    fake_email = random_fake_email(domain)
-
-    result = smtp_rcpt_check(
-        fake_email,
-        mx_records,
-        from_email,
-        helo_domain,
-        timeout_seconds=timeout_seconds,
-        max_mx_to_try=2,
-    )
-
-    if result["smtp_status"] == "ACEPTADO":
-        return {
-            "catchall_status": "SI",
-            "catchall_detail": f"Aceptó correo inventado: {fake_email}",
-        }
-
-    if result["smtp_status"] == "RECHAZADO":
-        return {
-            "catchall_status": "NO",
-            "catchall_detail": "Rechazó correo inventado",
-        }
-
-    return {
-        "catchall_status": "INCIERTO",
-        "catchall_detail": result.get("smtp_message", "No se pudo confirmar catch all"),
-    }
-
-
-def mx_records_to_text(mx_records):
-    return "|".join([f"{pref},{host}" for pref, host in mx_records])
+    return results
 
 
 # =========================
@@ -449,26 +319,30 @@ def build_score_and_recommendation(row):
     reasons = []
 
     if row["duplicado"] == "SI":
-        score -= 25
-        reasons.append("Duplicado")
+        return 20, "NO ENVIAR", "Duplicado"
 
     if row["formato_valido"] == "NO":
         return 0, "NO ENVIAR", "Formato inválido"
 
     if row["dominio_temporal"] == "SI":
-        score -= 45
-        reasons.append("Dominio temporal o desechable")
+        return 15, "NO ENVIAR", "Dominio temporal o desechable"
 
     if row["posible_error_dominio"]:
-        score -= 30
-        reasons.append(f"Posible error de dominio: {row['posible_error_dominio']}")
+        score -= 35
+        reasons.append(f"Posible error de dominio. Sugerencia: {row['posible_error_dominio']}")
 
     if row["dominio_existe"] == "NO":
         return 0, "NO ENVIAR", "Dominio no existe"
 
+    if row["dominio_existe"] == "INCIERTO":
+        score -= 25
+        reasons.append("No se pudo confirmar si el dominio existe")
+
     if row["mx"] == "NO":
-        score -= 45
-        reasons.append("Sin MX")
+        if row["dns_status"] in ["DOMINIO_NO_EXISTE", "NULL_MX", "SIN_MX"]:
+            return 10, "NO ENVIAR", "Dominio sin correo configurado o sin MX"
+        score -= 35
+        reasons.append("No se pudo confirmar MX")
 
     if row["correo_generico"] == "SI":
         score -= 10
@@ -478,60 +352,25 @@ def build_score_and_recommendation(row):
         score -= 5
         reasons.append("Proveedor gratuito")
 
-    smtp_status = row["smtp_status"]
-
-    if smtp_status == "RECHAZADO":
-        return 5, "NO ENVIAR", "Servidor SMTP rechazó el destinatario"
-
-    if smtp_status == "TEMPORAL":
-        score -= 30
-        reasons.append("Error temporal SMTP")
-
-    if smtp_status == "INCIERTO":
-        score -= 20
-        reasons.append("SMTP incierto o bloqueado")
-
-    if smtp_status == "NO_PROBADO":
-        score -= 15
-        reasons.append("SMTP no probado")
-
-    if row["catchall"] == "SI":
-        score -= 25
-        reasons.append("Dominio catch all")
-
-    if row["catchall"] == "INCIERTO":
-        score -= 10
-        reasons.append("Catch all incierto")
-
     score = max(0, min(100, score))
 
     if score >= 85:
-        recommendation = "ENVIAR"
-    elif score >= 70:
+        recommendation = "ENVIAR PROBABLE"
+    elif score >= 65:
         recommendation = "ENVIAR CON CUIDADO"
-    elif score >= 50:
-        recommendation = "INCIERTO"
-    elif score >= 30:
-        recommendation = "RIESGO ALTO"
+    elif score >= 40:
+        recommendation = "REVISAR"
     else:
         recommendation = "NO ENVIAR"
 
-    return score, recommendation, "; ".join(reasons) if reasons else "Sin alertas fuertes"
+    return score, recommendation, "; ".join(reasons) if reasons else "Pasó las pruebas técnicas básicas"
 
 
 # =========================
 # ANALISIS PRINCIPAL
 # =========================
 
-def analyze_one_email(
-    raw_email,
-    is_duplicate,
-    enable_smtp,
-    enable_catchall,
-    from_email,
-    helo_domain,
-    timeout_seconds
-):
+def analyze_one_email(raw_email, is_duplicate, dns_cache):
     clean = clean_email(raw_email)
 
     base_row = {
@@ -550,12 +389,6 @@ def analyze_one_email(
         "proveedor_gratuito": "NO",
         "dominio_temporal": "NO",
         "posible_error_dominio": "",
-        "smtp_status": "NO_PROBADO",
-        "smtp_code": "",
-        "smtp_message": "",
-        "smtp_server": "",
-        "catchall": "NO_PROBADO",
-        "catchall_detalle": "",
         "score": 0,
         "recomendacion": "NO ENVIAR",
         "motivos": "",
@@ -573,7 +406,7 @@ def analyze_one_email(
         base_row["motivos"] = "Formato inválido"
         return base_row
 
-    clean = normalized.lower()
+    clean = normalized
     domain = get_domain(clean)
 
     base_row["email_limpio"] = clean
@@ -584,7 +417,10 @@ def analyze_one_email(
     base_row["dominio_temporal"] = "SI" if is_disposable_domain(domain) else "NO"
     base_row["posible_error_dominio"] = domain_typo_suggestion(domain)
 
-    dns_info = get_dns_info(domain)
+    dns_info = dns_cache.get(domain)
+
+    if not dns_info:
+        dns_info = get_dns_info(domain)
 
     domain_exists = dns_info["domain_exists"]
 
@@ -596,40 +432,9 @@ def analyze_one_email(
         base_row["dominio_existe"] = "INCIERTO"
 
     base_row["mx"] = "SI" if dns_info["has_mx"] else "NO"
-    base_row["mx_records"] = ", ".join([host for _, host in dns_info["mx_records"]])
+    base_row["mx_records"] = dns_info["mx_records"]
     base_row["dns_status"] = dns_info["dns_status"]
     base_row["dns_error"] = dns_info["dns_error"]
-
-    if enable_smtp and dns_info["has_mx"]:
-        smtp_result = smtp_rcpt_check(
-            clean,
-            dns_info["mx_records"],
-            from_email,
-            helo_domain,
-            timeout_seconds=timeout_seconds,
-            max_mx_to_try=2,
-        )
-
-        base_row["smtp_status"] = smtp_result["smtp_status"]
-        base_row["smtp_code"] = smtp_result["smtp_code"]
-        base_row["smtp_message"] = smtp_result["smtp_message"]
-        base_row["smtp_server"] = smtp_result["smtp_server"]
-
-        if enable_catchall:
-            mx_text = mx_records_to_text(dns_info["mx_records"])
-
-            catchall_result = catchall_check_cached(
-                domain,
-                mx_text,
-                from_email,
-                helo_domain,
-                timeout_seconds,
-            )
-
-            base_row["catchall"] = catchall_result["catchall_status"]
-            base_row["catchall_detalle"] = catchall_result["catchall_detail"]
-        else:
-            base_row["catchall"] = "NO_PROBADO"
 
     score, recommendation, reasons = build_score_and_recommendation(base_row)
 
@@ -639,6 +444,10 @@ def analyze_one_email(
 
     return base_row
 
+
+# =========================
+# EXPORTACIONES
+# =========================
 
 def dataframe_to_excel_bytes(df):
     output = BytesIO()
@@ -663,26 +472,36 @@ def dataframe_to_excel_bytes(df):
     return output.getvalue()
 
 
+def dataframe_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
 # =========================
 # STREAMLIT UI
 # =========================
 
 st.set_page_config(
-    page_title="Validador de correos para campañas",
+    page_title="Limpieza segura de correos",
     layout="wide",
 )
 
-st.title("Validador de correos para campañas")
-st.caption("Limpieza y validación de listas antes de enviar campañas masivas.")
+st.title("Limpieza segura de correos para campañas")
+st.caption("Validación rápida sin SMTP y sin riesgo para tu dominio.")
 
 st.warning(
-    "Importante: ningún método puede confirmar al 100% que un correo está activo sin enviar un correo real. "
-    "Esta app calcula una seguridad probable usando formato, DNS, MX, SMTP, catch all y reglas de riesgo."
+    "Esta versión no usa SMTP. No envía correos, no se conecta a servidores como remitente "
+    "y no usa tu dominio para hacer pruebas. Sirve para limpieza técnica masiva antes de una campaña."
 )
 
 yellow_note(
-    "Objetivo de la app: ayudarte a reducir rebotes antes de mandar una campaña. "
-    "El resultado correcto no es una garantía absoluta, sino una recomendación de riesgo basada en varias pruebas."
+    "Qué sí valida esta app: formato, duplicados, dominio, registros MX, dominios inexistentes, "
+    "posibles errores de escritura, dominios temporales y correos genéricos."
+)
+
+yellow_note(
+    "Qué no puede confirmar: si el buzón exacto existe o está activo. "
+    "Ejemplo: puede confirmar que empresa.com recibe correo, pero no puede confirmar al 100% "
+    "que juan@empresa.com exista."
 )
 
 uploaded_file = st.file_uploader(
@@ -702,8 +521,7 @@ if uploaded_file:
         if total_rows > CONTACT_LIMIT:
             st.error(
                 f"El archivo tiene {total_rows:,} contactos. "
-                f"El límite recomendado por hoja es de {CONTACT_LIMIT:,} contactos. "
-                "Divide la lista en archivos más pequeños para evitar bloqueos, errores o resultados incompletos."
+                f"El límite de esta versión es de {CONTACT_LIMIT:,} contactos por archivo."
             )
             st.stop()
 
@@ -714,94 +532,14 @@ if uploaded_file:
             options=df.columns,
         )
 
-        st.markdown("## Configuración del análisis")
+        st.markdown("## Configuración de limpieza")
 
         yellow_note(
-            "Configuración recomendada para una primera prueba: SMTP activado, catch all activado, "
-            "timeout en 8 segundos, velocidad en 6 y limitar el análisis a 100 o 500 contactos. "
-            "Después, si todo funciona bien, puedes analizar la base completa."
+            "Esta configuración es segura porque no usa SMTP. "
+            "Puedes usarla para limpiar listas grandes sin exponer tu dominio a bloqueos por pruebas de servidor."
         )
 
-        with st.expander("Configuración avanzada", expanded=True):
-            st.markdown("### Ajustes del análisis")
-
-            yellow_note(
-                "Aquí puedes decidir qué tan profundo quieres revisar los correos. "
-                "Mientras más pruebas actives, mayor seguridad probable tendrás, pero también tardará más el análisis."
-            )
-
-            enable_smtp = st.checkbox(
-                "Activar prueba SMTP sin enviar correo",
-                value=True,
-            )
-
-            yellow_note(
-                "Qué hace esto: intenta preguntarle al servidor del correo si ese destinatario parece válido, "
-                "sin mandar un correo real. Es una de las pruebas más útiles, pero también es de las más lentas. "
-                "Algunos servidores pueden bloquearla y devolver un resultado incierto."
-            )
-
-            enable_catchall = st.checkbox(
-                "Detectar dominios catch all",
-                value=True,
-            )
-
-            yellow_note(
-                "Qué significa catch all: algunos dominios aceptan cualquier correo, aunque el buzón no exista realmente. "
-                "Esta prueba intenta detectar eso usando un correo inventado del mismo dominio. "
-                "Si el dominio es catch all, el resultado será menos confiable."
-            )
-
-            from_email = st.text_input(
-                "Correo FROM para la prueba SMTP",
-                value="verificador@tudominio.com",
-            )
-
-            yellow_note(
-                "Qué va aquí: debes poner un correo real de tu propio dominio. "
-                "Ejemplo: contacto@tuempresa.com. "
-                "Este correo solo se usa para presentarse ante el servidor durante la validación. "
-                "No uses un correo inventado ni un dominio que no te pertenece."
-            )
-
-            helo_domain = st.text_input(
-                "Dominio HELO/EHLO",
-                value="tudominio.com",
-            )
-
-            yellow_note(
-                "Qué va aquí: solo el dominio de tu empresa, sin arroba. "
-                "Ejemplo: tuempresa.com. "
-                "Normalmente debe coincidir con el dominio del correo FROM. "
-                "Si tu correo FROM es contacto@tuempresa.com, aquí pondrías tuempresa.com."
-            )
-
-            timeout_seconds = st.slider(
-                "Timeout por intento SMTP, en segundos",
-                min_value=3,
-                max_value=20,
-                value=8,
-            )
-
-            yellow_note(
-                "Qué significa esto: es el tiempo máximo que la app esperará una respuesta del servidor por cada intento SMTP. "
-                "Si lo pones muy bajo, algunos correos pueden salir como inciertos aunque sí sean buenos. "
-                "Si lo pones muy alto, el análisis tardará más. Recomendado: entre 6 y 8 segundos."
-            )
-
-            max_workers = st.slider(
-                "Velocidad de análisis",
-                min_value=1,
-                max_value=20,
-                value=6,
-            )
-
-            yellow_note(
-                "Qué significa esto: es cuántos correos se revisan al mismo tiempo. "
-                "Más alto significa más rápido, pero también aumenta el riesgo de bloqueos, respuestas erróneas o resultados inciertos. "
-                "Recomendado para campañas reales: entre 4 y 8."
-            )
-
+        with st.expander("Configuración", expanded=True):
             limit_rows = st.number_input(
                 "Limitar cantidad de filas a analizar. Usa 0 para analizar todas.",
                 min_value=0,
@@ -809,73 +547,68 @@ if uploaded_file:
             )
 
             yellow_note(
-                "Para qué sirve esto: si quieres probar primero una parte de tu base, aquí puedes limitar cuántos contactos analizar. "
-                "Ejemplo: pon 100 o 500 para una prueba rápida. "
-                "Si dejas 0, la app analizará todos los contactos del archivo."
+                "Para qué sirve: si quieres probar primero una parte de tu base, escribe 100, 500 o 2,000. "
+                "Si lo dejas en 0, se analizará todo el archivo."
             )
 
-        contacts_to_analyze = total_rows if limit_rows == 0 else min(total_rows, int(limit_rows))
-        estimated_time = estimate_time_range(contacts_to_analyze, enable_smtp, enable_catchall)
+            dns_workers = st.slider(
+                "Velocidad de revisión de dominios",
+                min_value=1,
+                max_value=50,
+                value=15,
+            )
+
+            yellow_note(
+                "Qué significa: es cuántos dominios se revisan al mismo tiempo. "
+                "Como esta versión no usa SMTP, el riesgo es mucho menor. "
+                "Recomendado: 10 a 20. Si tu internet o servidor va lento, usa 5 a 10."
+            )
+
+        work_df = df.copy()
+
+        if limit_rows and limit_rows > 0:
+            work_df = work_df.head(int(limit_rows)).copy()
+
+        contacts_to_analyze = len(work_df)
+
+        cleaned_preview = [clean_email(x) for x in work_df[email_column].head(5000).tolist()]
+        preview_domains = sorted(set([get_domain(x) for x in cleaned_preview if "@" in x]))
+
+        estimated_time = estimate_time_range(contacts_to_analyze, len(preview_domains))
 
         st.subheader("Capacidad y tiempo estimado")
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric("Contactos detectados", f"{total_rows:,}")
-        c2.metric("Límite por archivo", f"{CONTACT_LIMIT:,}")
+        c1.metric("Contactos en archivo", f"{total_rows:,}")
+        c2.metric("Límite seguro", f"{CONTACT_LIMIT:,}")
         c3.metric("Contactos a analizar", f"{contacts_to_analyze:,}")
         c4.metric("Tiempo estimado", estimated_time)
 
         yellow_note(
-            "Los tiempos son aproximados. Las pruebas SMTP y catch all pueden tardar más porque dependen de servidores externos. "
-            "Si muchos servidores no responden rápido, el análisis puede tardar más de lo estimado."
+            "El tiempo depende principalmente de cuántos dominios únicos tenga tu lista. "
+            "Por ejemplo, 100,000 correos de pocos dominios puede ser rápido. "
+            "100,000 correos con miles de dominios diferentes puede tardar más."
         )
 
         with st.expander("Ver tabla de tiempos promedio"):
             st.markdown(
                 """
-| Cantidad de contactos | Sin SMTP | Con SMTP | Con SMTP + catch all |
-|---:|---:|---:|---:|
-| 1 a 500 | Menos de 1 minuto | 3 a 10 minutos | 5 a 15 minutos |
-| 501 a 2,000 | 1 a 3 minutos | 10 a 30 minutos | 20 a 60 minutos |
-| 2,001 a 10,000 | 3 a 10 minutos | 45 minutos a 3 horas | 1.5 a 5 horas |
-| 10,001 a 25,000 | 10 a 25 minutos | 2 a 6 horas | 4 a 10 horas |
+| Cantidad de contactos | Tiempo aproximado sin SMTP |
+|---:|---:|
+| 1 a 2,000 | Menos de 1 a 3 minutos |
+| 2,001 a 25,000 | 3 a 10 minutos |
+| 25,001 a 100,000 | 10 a 30 minutos |
+| 100,001 a 500,000 | 30 minutos a 2 horas |
+| 500,001 a 1,000,000 | 1 a 4 horas |
                 """
             )
 
-        if contacts_to_analyze > 2000 and enable_smtp:
-            st.info(
-                "Este archivo puede tardar bastante por las pruebas SMTP. "
-                "Si es la primera prueba, puedes limitar el análisis a 100, 500 o 2,000 contactos."
-            )
-
-        if enable_smtp:
-            sender_ok, _, sender_error = validate_syntax(from_email)
-
-            if not sender_ok:
-                st.error(f"El correo FROM no es válido: {sender_error}")
-                st.stop()
-
-            if "@" not in from_email:
-                st.error("El correo FROM debe tener dominio.")
-                st.stop()
-
-            if "tudominio.com" in from_email or helo_domain == "tudominio.com":
-                st.warning(
-                    "Aún tienes valores de ejemplo en el correo FROM o en el dominio HELO/EHLO. "
-                    "Cámbialos por datos reales de tu dominio para obtener resultados más confiables."
-                )
-
-        preview_df = df[[email_column]].head(10)
-
         st.subheader("Vista previa")
-        st.dataframe(preview_df, use_container_width=True)
+        st.dataframe(work_df[[email_column]].head(10), use_container_width=True)
 
         if st.button("Analizar correos", type="primary"):
-            work_df = df.copy()
-
-            if limit_rows and limit_rows > 0:
-                work_df = work_df.head(int(limit_rows)).copy()
+            start_time = pd.Timestamp.now()
 
             raw_emails = work_df[email_column].tolist()
             cleaned_emails = [clean_email(x) for x in raw_emails]
@@ -891,111 +624,134 @@ if uploaded_file:
                     if email:
                         seen.add(email)
 
-            progress = st.progress(0)
-            status_text = st.empty()
+            valid_domains = []
+            for email in cleaned_emails:
+                if "@" in email:
+                    domain = get_domain(email)
+                    if domain:
+                        valid_domains.append(domain)
+
+            unique_domains = sorted(set(valid_domains))
+
+            st.info(f"Dominios únicos detectados para revisar: {len(unique_domains):,}")
+
+            progress_domains = st.progress(0)
+            domain_status = st.empty()
+
+            dns_cache = {}
+
+            if unique_domains:
+                completed = 0
+
+                with ThreadPoolExecutor(max_workers=dns_workers) as executor:
+                    future_map = {
+                        executor.submit(get_dns_info, domain): domain
+                        for domain in unique_domains
+                    }
+
+                    total_domains = len(future_map)
+
+                    for future in as_completed(future_map):
+                        domain = future_map[future]
+
+                        try:
+                            dns_cache[domain] = future.result()
+                        except Exception as e:
+                            dns_cache[domain] = {
+                                "domain_exists": None,
+                                "has_mx": False,
+                                "mx_records": "",
+                                "has_a_or_aaaa": False,
+                                "dns_status": "ERROR_DNS",
+                                "dns_error": str(e),
+                            }
+
+                        completed += 1
+                        progress_domains.progress(completed / total_domains)
+                        domain_status.text(
+                            f"Revisando dominios: {completed:,} de {total_domains:,}"
+                        )
+
+            progress_emails = st.progress(0)
+            email_status = st.empty()
 
             results = []
-            total = len(raw_emails)
+            total_emails = len(raw_emails)
 
-            start_time = time.time()
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-
-                for raw_email, duplicate in zip(raw_emails, duplicates):
-                    futures.append(
-                        executor.submit(
-                            analyze_one_email,
-                            raw_email,
-                            duplicate,
-                            enable_smtp,
-                            enable_catchall,
-                            from_email,
-                            helo_domain,
-                            timeout_seconds,
-                        )
+            for i, (raw_email, duplicate) in enumerate(zip(raw_emails, duplicates), start=1):
+                results.append(
+                    analyze_one_email(
+                        raw_email=raw_email,
+                        is_duplicate=duplicate,
+                        dns_cache=dns_cache,
                     )
+                )
 
-                for i, future in enumerate(as_completed(futures), start=1):
-                    try:
-                        results.append(future.result())
-                    except Exception as e:
-                        results.append({
-                            "email_original": "",
-                            "email_limpio": "",
-                            "duplicado": "",
-                            "formato_valido": "NO",
-                            "formato_error": str(e),
-                            "dominio": "",
-                            "dominio_existe": "INCIERTO",
-                            "mx": "NO",
-                            "mx_records": "",
-                            "dns_status": "ERROR",
-                            "dns_error": str(e),
-                            "correo_generico": "",
-                            "proveedor_gratuito": "",
-                            "dominio_temporal": "",
-                            "posible_error_dominio": "",
-                            "smtp_status": "INCIERTO",
-                            "smtp_code": "",
-                            "smtp_message": str(e),
-                            "smtp_server": "",
-                            "catchall": "INCIERTO",
-                            "catchall_detalle": "",
-                            "score": 0,
-                            "recomendacion": "INCIERTO",
-                            "motivos": str(e),
-                        })
-
-                    progress.progress(i / total)
-                    status_text.text(f"Analizando {i:,} de {total:,} correos...")
-
-            elapsed = round(time.time() - start_time, 2)
+                if i % 1000 == 0 or i == total_emails:
+                    progress_emails.progress(i / total_emails)
+                    email_status.text(f"Clasificando correos: {i:,} de {total_emails:,}")
 
             result_df = pd.DataFrame(results)
 
             order_map = {
-                "ENVIAR": 1,
+                "ENVIAR PROBABLE": 1,
                 "ENVIAR CON CUIDADO": 2,
-                "INCIERTO": 3,
-                "RIESGO ALTO": 4,
-                "NO ENVIAR": 5,
+                "REVISAR": 3,
+                "NO ENVIAR": 4,
             }
 
             result_df["orden"] = result_df["recomendacion"].map(order_map).fillna(99)
             result_df = result_df.sort_values(by=["orden", "score"], ascending=[True, False])
             result_df = result_df.drop(columns=["orden"])
 
-            st.success(f"Análisis terminado en {elapsed} segundos")
+            end_time = pd.Timestamp.now()
+            elapsed_seconds = round((end_time - start_time).total_seconds(), 2)
+
+            st.success(f"Análisis terminado en {elapsed_seconds} segundos")
 
             st.subheader("Resumen")
 
             r1, r2, r3, r4, r5 = st.columns(5)
 
             r1.metric("Total", len(result_df))
-            r2.metric("Enviar", int((result_df["recomendacion"] == "ENVIAR").sum()))
+            r2.metric("Enviar probable", int((result_df["recomendacion"] == "ENVIAR PROBABLE").sum()))
             r3.metric("Con cuidado", int((result_df["recomendacion"] == "ENVIAR CON CUIDADO").sum()))
-            r4.metric("Inciertos", int((result_df["recomendacion"] == "INCIERTO").sum()))
+            r4.metric("Revisar", int((result_df["recomendacion"] == "REVISAR").sum()))
             r5.metric("No enviar", int((result_df["recomendacion"] == "NO ENVIAR").sum()))
 
             yellow_note(
-                "Recomendación de uso: manda primero solo a los contactos marcados como ENVIAR. "
-                "Los de ENVIAR CON CUIDADO pueden ir en una segunda tanda pequeña. "
-                "Los INCIERTOS conviene revisarlos manualmente. "
-                "Los de NO ENVIAR deben eliminarse de la campaña."
+                "Cómo usar el resultado: primero manda campaña solo a los contactos marcados como ENVIAR PROBABLE. "
+                "Los de ENVIAR CON CUIDADO pueden mandarse en una tanda pequeña. "
+                "Los de REVISAR conviene validarlos manualmente. "
+                "Los de NO ENVIAR elimínalos de la campaña."
             )
 
             st.subheader("Resultado")
             st.dataframe(result_df, use_container_width=True)
 
-            excel_bytes = dataframe_to_excel_bytes(result_df)
+            csv_bytes = dataframe_to_csv_bytes(result_df)
 
             st.download_button(
-                label="Descargar resultado en Excel",
-                data=excel_bytes,
-                file_name="correos_validados.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label="Descargar resultado en CSV",
+                data=csv_bytes,
+                file_name="correos_limpios.csv",
+                mime="text/csv",
             )
+
+            if len(result_df) <= 200_000:
+                excel_bytes = dataframe_to_excel_bytes(result_df)
+
+                st.download_button(
+                    label="Descargar resultado en Excel",
+                    data=excel_bytes,
+                    file_name="correos_limpios.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                st.info(
+                    "Para archivos muy grandes se recomienda descargar en CSV. "
+                    "Excel puede tardar demasiado o pesar mucho con más de 200,000 filas."
+                )
 
     except Exception as e:
         st.error(f"No se pudo procesar el archivo: {e}")
